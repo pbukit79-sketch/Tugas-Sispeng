@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Monitoring Penetas Telur</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getDatabase, ref, onValue, set, get } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+  // Konfigurasi Firebase — sesuai #define di ESP32
+  const firebaseConfig = {
+    apiKey:      "AIzaSyAdXkj50DFjpO41EXGcpTIzNIkeSZpO6r0",
+    databaseURL: "https://penetas-telur-2a65a-default-rtdb.asia-southeast1.firebasedatabase.app/"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db  = getDatabase(app);
+
+  // Path Firebase sama persis dengan ESP32
+  const PATH_DATA     = "/Sensor/Data";       // temp & hum ditulis ESP32
+  const PATH_INTERVAL = "/Control/interval";  // dibaca ESP32 tiap loop
+  const PATH_LOGGING  = "/Control/logging";   // dibaca ESP32 tiap loop
+
+  const MAX_POINTS = 30;
+  let tempChart, humChart;
+
+  /* ── Helpers ──────────────────────────────────────────────── */
+  function now() {
+    return new Date().toLocaleTimeString('id-ID', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
+  }
+
+  function getStatus(temp) {
+    if (temp === null || temp === undefined) return { text:'Menunggu data…', cls:'status-wait' };
+    if (temp > 39.0)  return { text:'🔴 SUHU TERLALU TINGGI',       cls:'status-danger' };
+    if (temp < 34.0)  return { text:'🔵 SUHU TERLALU RENDAH',       cls:'status-cold'   };
+    if (temp < 35.0)  return { text:'🟡 MENDEKATI BATAS BAWAH',     cls:'status-warn'   };
+                      return { text:'🟢 KONDISI NORMAL',            cls:'status-ok'     };
+  }
+
+  /* ── UI updates ───────────────────────────────────────────── */
+  function updateCards(temp, hum) {
+    document.getElementById('val-temp').textContent = temp != null ? temp.toFixed(1)+'°C' : '--';
+    document.getElementById('val-hum').textContent  = hum  != null ? hum.toFixed(1)+'%'   : '--';
+    const s  = getStatus(temp);
+    const el = document.getElementById('status-badge');
+    el.textContent = s.text;
+    el.className   = 'status-badge ' + s.cls;
+  }
+
+  function addTableRow(temp, hum) {
+    const tbody = document.getElementById('log-tbody');
+    // hapus baris placeholder kalau masih ada
+    if (tbody.rows.length === 1 && tbody.rows[0].cells.length === 1) tbody.deleteRow(0);
+    const s  = getStatus(temp);
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${now()}</td>
+      <td>${temp != null ? temp.toFixed(2) : '--'}</td>
+      <td>${hum  != null ? hum.toFixed(2)  : '--'}</td>
+      <td class="${s.cls.replace('status-','badge-')}">${s.text}</td>`;
+    tbody.insertBefore(tr, tbody.firstChild);
+    if (tbody.rows.length > 50) tbody.deleteRow(tbody.rows.length - 1);
+  }
+
+  function pushChart(temp, hum) {
+    const t = now();
+    const push = (chart, val) => {
+      chart.data.labels.push(t);
+      chart.data.datasets[0].data.push(val != null ? parseFloat(val.toFixed(2)) : null);
+      if (chart.data.labels.length > MAX_POINTS) {
+        chart.data.labels.shift();
+        chart.data.datasets[0].data.shift();
+      }
+      chart.update();
+    };
+    push(tempChart, temp);
+    push(humChart,  hum);
+  }
+
+  /* ── Chart init ───────────────────────────────────────────── */
+  function initCharts() {
+    const cfg = (label, color) => ({
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [{
+          label, data: [],
+          borderColor: color,
+          backgroundColor: color + '22',
+          borderWidth: 2, pointRadius: 2, tension: 0.4, fill: true
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        animation: { duration: 300 },
+        scales: {
+          x: { ticks: { maxTicksLimit:8, color:'#8899aa', font:{size:11} }, grid:{color:'#1e2a38'} },
+          y: { ticks: { color:'#8899aa', font:{size:11} }, grid:{color:'#1e2a38'} }
+        },
+        plugins: { legend:{ labels:{ color:'#cdd9e5', font:{size:12} } } }
+      }
+    });
+    tempChart = new Chart(document.getElementById('chart-temp'), cfg('Suhu (°C)',      '#f87171'));
+    humChart  = new Chart(document.getElementById('chart-hum'),  cfg('Kelembaban (%)', '#38bdf8'));
+  }
+
+  /* ── Firebase listeners ───────────────────────────────────── */
+  function listenSensor() {
+    // /Sensor/Data ditulis oleh ESP32: { temperature, humidity }
+    onValue(ref(db, PATH_DATA), snap => {
+      if (!snap.exists()) return;
+      const d    = snap.val();
+      const temp = d.temperature ?? null;
+      const hum  = d.humidity    ?? null;
+      updateCards(temp, hum);
+      addTableRow(temp, hum);
+      pushChart(temp, hum);
+    });
+  }
+
+  function listenControl() {
+    // /Control/interval — dibaca ESP32, diset dari web
+    onValue(ref(db, PATH_INTERVAL), snap => {
+      if (!snap.exists()) return;
+      const val = snap.val();
+      document.getElementById('interval-val').value      = val;
+      document.getElementById('interval-display').textContent = val + ' ms';
+    });
+
+    // /Control/logging — dibaca ESP32, toggle dari web
+    onValue(ref(db, PATH_LOGGING), snap => {
+      if (!snap.exists()) return;
+      const on  = snap.val();
+      const btn = document.getElementById('btn-logging');
+      btn.textContent = on ? '⏹ Stop Logging' : '▶ Start Logging';
+      btn.className   = 'btn ' + (on ? 'btn-stop' : 'btn-start');
+      const badge = document.getElementById('logging-status');
+      badge.textContent = on ? 'Logging: AKTIF' : 'Logging: NONAKTIF';
+      badge.className   = 'log-badge ' + (on ? 'log-on' : 'log-off');
+    });
+  }
+
+  /* ── Kontrol dari web → Firebase (dibaca ESP32 di loop) ───── */
+  window.setInterval_ = async () => {
+    const val = parseInt(document.getElementById('interval-val').value);
+    if (isNaN(val) || val < 2000) { showToast('⚠ Interval minimal 2000 ms (batas DHT22)'); return; }
+    await set(ref(db, PATH_INTERVAL), val);
+    showToast('✅ Interval diperbarui: ' + val + ' ms');
+  };
+
+  window.toggleLogging = async () => {
+    const snap = await get(ref(db, PATH_LOGGING));
+    const cur  = snap.exists() ? snap.val() : true;
+    await set(ref(db, PATH_LOGGING), !cur);
+    showToast(!cur ? '✅ Logging diaktifkan' : '⏹ Logging dihentikan');
+  };
+
+  /* ── Toast ────────────────────────────────────────────────── */
+  function showToast(msg) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    setTimeout(() => t.classList.remove('show'), 2500);
+  }
+
+  /* ── Boot ─────────────────────────────────────────────────── */
+  window.addEventListener('DOMContentLoaded', () => {
+    initCharts();
+    listenSensor();
+    listenControl();
+  });
+</script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@400;700;800&display=swap');
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  :root{
+    --bg:#0a0f1a; --surface:#101827; --border:#1e2d40;
+    --text:#cdd9e5; --muted:#5a7080; --accent:#0ea5e9;
+    --danger:#f87171; --warn:#fbbf24; --ok:#4ade80; --cold:#818cf8;
+  }
+  body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;min-height:100vh}
+
+  /* ── Header ── */
+  header{background:var(--surface);border-bottom:1px solid var(--border);padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between}
+  header h1{font-size:1.15rem;font-weight:800;letter-spacing:.05em;color:#fff}
+  header h1 span{color:var(--accent)}
+  .log-badge{font-size:11px;font-weight:600;padding:4px 10px;border-radius:20px;font-family:'JetBrains Mono',monospace}
+  .log-on {background:#052e16;color:var(--ok);border:1px solid #166534}
+  .log-off{background:#1c1917;color:var(--muted);border:1px solid #44403c}
+
+  main{max-width:1200px;margin:0 auto;padding:2rem 1.5rem;display:flex;flex-direction:column;gap:1.5rem}
+
+  /* ── Kartu ── */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.25rem 1.5rem}
+  .card-label{font-size:11px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase;margin-bottom:.5rem}
+  .card-val{font-family:'JetBrains Mono',monospace;font-size:2.2rem;font-weight:600;color:#fff}
+  .card-val.temp{color:var(--danger)} .card-val.hum{color:var(--accent)}
+
+  /* ── Status badge ── */
+  .status-badge{font-size:13px;font-weight:700;padding:10px 18px;border-radius:8px;display:inline-block;letter-spacing:.03em}
+  .status-ok    {background:#052e16;color:var(--ok);border:1px solid #166534}
+  .status-danger{background:#2d0a0a;color:var(--danger);border:1px solid #7f1d1d;animation:pulse .8s infinite}
+  .status-cold  {background:#0d0d2e;color:var(--cold);border:1px solid #312e81;animation:pulse .8s infinite}
+  .status-warn  {background:#1c1205;color:var(--warn);border:1px solid #78350f}
+  .status-wait  {background:var(--surface);color:var(--muted);border:1px solid var(--border)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+
+  /* ── Section ── */
+  .section{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  .section-header{padding:.875rem 1.25rem;border-bottom:1px solid var(--border);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);display:flex;align-items:center;gap:8px}
+  .section-body{padding:1.25rem}
+
+  /* ── Grafik ── */
+  .charts{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+  @media(max-width:680px){.charts{grid-template-columns:1fr}}
+  .chart-wrap{height:220px;position:relative}
+  .chart-label{font-size:12px;color:var(--muted);margin-bottom:8px}
+
+  /* ── Kontrol ── */
+  .controls{display:flex;flex-wrap:wrap;gap:1rem;align-items:flex-end}
+  .field{display:flex;flex-direction:column;gap:6px}
+  .field label{font-size:12px;color:var(--muted)}
+  .field input[type=number]{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 12px;font-family:'JetBrains Mono',monospace;font-size:14px;width:170px;outline:none}
+  .field input[type=number]:focus{border-color:var(--accent)}
+  .hint{font-size:11px;color:var(--muted);margin-top:2px}
+  .btn{padding:9px 20px;border-radius:8px;border:none;cursor:pointer;font-family:'Syne',sans-serif;font-weight:700;font-size:13px;transition:opacity .15s,transform .1s}
+  .btn:hover{opacity:.82} .btn:active{transform:scale(.97)}
+  .btn-primary{background:var(--accent);color:#fff}
+  .btn-start{background:#052e16;color:var(--ok);border:1px solid #166534}
+  .btn-stop {background:#2d0a0a;color:var(--danger);border:1px solid #7f1d1d}
+
+  /* ── Kondisi khusus ── */
+  .kondisi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:.75rem}
+  .k{border-radius:8px;padding:.875rem 1rem;font-size:13px;line-height:1.6}
+  .k strong{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px;font-family:'JetBrains Mono',monospace}
+  .k-ok  {background:#052e16;color:var(--ok);border:1px solid #166534}
+  .k-high{background:#2d0a0a;color:var(--danger);border:1px solid #7f1d1d}
+  .k-low {background:#0d0d2e;color:var(--cold);border:1px solid #312e81}
+  .k-warn{background:#1c1205;color:var(--warn);border:1px solid #78350f}
+
+  /* ── Tabel ── */
+  .table-wrap{overflow-x:auto;max-height:320px;overflow-y:auto}
+  table{width:100%;border-collapse:collapse;font-size:13px;font-family:'JetBrains Mono',monospace}
+  thead th{background:var(--bg);color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em;padding:8px 12px;text-align:left;position:sticky;top:0;z-index:1}
+  tbody td{padding:8px 12px;border-bottom:1px solid var(--border);color:var(--text)}
+  tbody tr:hover td{background:#111c2a}
+  .badge-ok    {color:var(--ok)}
+  .badge-danger{color:var(--danger)}
+  .badge-cold  {color:var(--cold)}
+  .badge-warn  {color:var(--warn)}
+  .badge-wait  {color:var(--muted)}
+
+  /* ── Toast ── */
+  #toast{position:fixed;bottom:2rem;left:50%;transform:translateX(-50%) translateY(16px);background:#0ea5e9;color:#fff;padding:10px 22px;border-radius:8px;font-size:13px;font-weight:600;opacity:0;transition:opacity .3s,transform .3s;pointer-events:none;z-index:999}
+  #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);display:inline-block;animation:pulse .8s infinite}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🥚 Penetas <span>Telur</span> Monitor</h1>
+  <div style="display:flex;align-items:center;gap:12px">
+    <span id="logging-status" class="log-badge log-off">Logging: NONAKTIF</span>
+    <span class="dot"></span>
+  </div>
+</header>
+
+<main>
+
+  <!-- Kartu suhu & kelembaban -->
+  <div class="cards">
+    <div class="card">
+      <div class="card-label">Suhu</div>
+      <div class="card-val temp" id="val-temp">--</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Kelembaban</div>
+      <div class="card-val hum" id="val-hum">--</div>
+    </div>
+    <div class="card" style="grid-column:span 2">
+      <div class="card-label">Status Kondisi</div>
+      <span id="status-badge" class="status-badge status-wait">Menunggu data…</span>
+    </div>
+  </div>
+
+  <!-- Grafik -->
+  <div class="section">
+    <div class="section-header">📈 Grafik Real-time</div>
+    <div class="section-body">
+      <div class="charts">
+        <div><div class="chart-label">Suhu (°C)</div><div class="chart-wrap"><canvas id="chart-temp"></canvas></div></div>
+        <div><div class="chart-label">Kelembaban (%)</div><div class="chart-wrap"><canvas id="chart-hum"></canvas></div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Setting interval + toggle logging -->
+  <div class="section">
+    <div class="section-header">⚙️ Kontrol</div>
+    <div class="section-body">
+      <div class="controls">
+        <div class="field">
+          <label>Interval Kirim (ms)</label>
+          <input type="number" id="interval-val" min="2000" step="500" value="5000" />
+          <span class="hint">Min. 2000 ms &nbsp;|&nbsp; Aktif: <b id="interval-display">5000 ms</b></span>
+        </div>
+        <button class="btn btn-primary" onclick="setInterval_()">💾 Simpan Interval</button>
+        <button class="btn btn-stop" id="btn-logging" onclick="toggleLogging()">⏹ Stop Logging</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Kondisi Khusus -->
+  <div class="section">
+    <div class="section-header">⚠️ Kondisi Khusus</div>
+    <div class="section-body">
+      <div class="kondisi-grid">
+        <div class="k k-ok">
+          <strong>Normal</strong>
+          Suhu 35°C – 39°C<br>Buzzer OFF · Data tercatat normal
+        </div>
+        <div class="k k-high">
+          <strong>Suhu Terlalu Tinggi</strong>
+          Suhu &gt; 39°C<br>Buzzer ON · LCD: <code>BAHAYA</code>
+        </div>
+        <div class="k k-low">
+          <strong>Suhu Terlalu Rendah</strong>
+          Suhu &lt; 34°C<br>Buzzer ON · LCD: <code>BAHAYA</code>
+        </div>
+        <div class="k k-warn">
+          <strong>Mendekati Batas Bawah</strong>
+          Suhu 34°C – 35°C<br>Peringatan kuning · Buzzer OFF
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tabel log -->
+  <div class="section">
+    <div class="section-header">📋 Tabel Log Data</div>
+    <div class="section-body" style="padding:0">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Waktu</th>
+              <th>Suhu (°C)</th>
+              <th>Kelembaban (%)</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="log-tbody">
+            <tr><td colspan="4" style="text-align:center;color:var(--muted);padding:2rem 0">Menunggu data dari Firebase…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<div id="toast"></div>
+</body>
+</html>
